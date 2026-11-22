@@ -160,6 +160,32 @@ export function runSelftest() {
     return 'all positions finite after 300 steps';
   });
 
+  check('mission 3 completes: ram the van, Juno hacks the lock', () => {
+    const s = freshWorld();
+    startMission(s, 2); // Prison Van Breakout
+    step(s, IDLE, 10); // let the van spawn
+    const van = s.mission.van;
+    assert(van, 'prison van did not spawn');
+    const car = nearestStealableCar(s, 3000);
+    assert(car, 'no stealable car found');
+    s.player.x = car.x; s.player.y = car.y;
+    enterCar(s, car);
+    // A ram only counts above 200 px/s, so this DRIVES into the van: park
+    // the car 250px behind it along its heading, then home in at full speed.
+    car.x = van.x - Math.cos(van.angle) * 250; car.y = van.y - Math.sin(van.angle) * 250;
+    s.player.x = car.x; s.player.y = car.y;
+    car.angle = van.angle; s.player.angle = van.angle;
+    let done = false;
+    for (let i = 0; i < 900 && !done; i++) {
+      car.angle = Math.atan2(van.y - car.y, van.x - car.x);
+      s.player.angle = car.angle;
+      step(s, { up: true }, 1);
+      if (s.missionIndex === 3) done = true;
+    }
+    assert(done, `mission 3 did not complete in 15s (van hp ${Math.round(van.hp)}, hack ${Math.round(s.hackProgress)}%)`);
+    return `van rammed (hp ${Math.round(van.hp)}), hack complete, mission 4 active`;
+  });
+
   check('tail mission: suspicion rises when too close (verb test)', () => {
     const s = freshWorld();
     startMission(s, 1); // Tail Job

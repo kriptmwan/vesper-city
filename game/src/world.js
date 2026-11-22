@@ -147,8 +147,14 @@ export function damageCar(state, car, dmg, fromX, fromY) {
   car.hp -= dmg;
   if (car.hp <= 0) {
     car.dead = true; car.onFire = true; car.fireT = 0;
-    explode(state, car.x, car.y, 130);
-    state.audio.explosion();
+    // Ambient traffic just burns out — if every plowed-through sedan
+    // exploded, ramming the mission van through traffic would be suicide
+    // (each blast is 60 damage to everything nearby, including the player).
+    // Mission/combat cars (police, SWAT, van, player, courier) still blow up.
+    if (car.kind !== 'traffic' && car.kind !== 'parked') {
+      explode(state, car.x, car.y, 130);
+      state.audio.explosion();
+    }
     if (car.kind === 'police' || car.kind === 'swat') addWanted(state, 0.5);
   }
 }
@@ -208,6 +214,9 @@ export function nearestStealableCar(state, maxDist) {
   let best = null, bd = maxDist;
   for (const car of state.cars) {
     if (car.dead || car.kind === 'player') continue;
+    // Only parked/traffic cars can be stolen — never the mission van, a
+    // police car, or the courier (entering the van would break mission 3).
+    if (car.kind !== 'parked' && car.kind !== 'traffic') continue;
     const d = dist(state.player.x, state.player.y, car.x, car.y);
     if (d < bd) { bd = d; best = car; }
   }
@@ -296,23 +305,27 @@ function ensureCops(state) {
 }
 
 // --- traffic / peds ------------------------------------------------------------
+// Shared road-following: steer to the nearest road, then along it,
+// sometimes turning at intersections. Used by traffic and by the mission van.
+function steerOnRoads(state, car, dt, turnChance) {
+  const p = state.city.nearestRoadPoint(car.x, car.y);
+  const onRoad = dist(car.x, car.y, p.x, p.y) < 30;
+  if (!onRoad) {
+    car.angle += angleDiff(car.angle, angleTo(car.x, car.y, p.x, p.y)) * 2 * dt;
+    car.speed = Math.min(car.speed + 200 * dt, car.cruise * 0.7);
+  } else {
+    const nearV = state.city.roadsV.some(r => Math.abs(car.x - r) < 26);
+    const nearH = state.city.roadsH.some(r => Math.abs(car.y - r) < 26);
+    if (nearV && nearH && state.rng.chance(turnChance)) car.angle += (state.rng.chance(0.5) ? 1 : -1) * Math.PI / 2;
+    car.speed = Math.min(car.speed + 160 * dt, car.cruise);
+  }
+}
+
 function updateTraffic(state, dt) {
   for (const car of state.cars) {
     if (car.kind !== 'traffic') continue;
     if (car.dead) continue;
-    // Follow the road grid: steer toward the nearest road, then along it.
-    const p = state.city.nearestRoadPoint(car.x, car.y);
-    const onRoad = dist(car.x, car.y, p.x, p.y) < 30;
-    if (!onRoad) {
-      car.angle += angleDiff(car.angle, angleTo(car.x, car.y, p.x, p.y)) * 2 * dt;
-      car.speed = Math.min(car.speed + 200 * dt, car.cruise * 0.7);
-    } else {
-      // At intersections, sometimes turn.
-      const nearV = state.city.roadsV.some(r => Math.abs(car.x - r) < 26);
-      const nearH = state.city.roadsH.some(r => Math.abs(car.y - r) < 26);
-      if (nearV && nearH && state.rng.chance(0.004)) car.angle += (state.rng.chance(0.5) ? 1 : -1) * Math.PI / 2;
-      car.speed = Math.min(car.speed + 160 * dt, car.cruise);
-    }
+    steerOnRoads(state, car, dt, 0.004);
     // Don't rear-end the player.
     const pc = playerCar(state);
     if (pc && dist(car.x, car.y, pc.x, pc.y) < 90) car.speed = Math.max(0, car.speed - 500 * dt);
@@ -382,16 +395,20 @@ function updateMission(state, dt) {
     case 'm2': { // tail the courier
       const courier = state.cars.find(c => c.kind === 'courier');
       if (!courier) {
-        const c = makeCar(state, 'courier', t.x, t.y, 0, '#d8c040');
+        // Spawn on the nearest road so the tail is drivable, not through blocks.
+        const rp = state.city.nearestRoadPoint(t.x, t.y);
+        const c = makeCar(state, 'courier', rp.x, rp.y, 0, '#d8c040');
+        const onV = state.city.roadsV.some(r => Math.abs(rp.x - r) < 30);
+        c.angle = onV ? Math.PI / 2 : 0;
         c.cruise = 120;
         state.mission.courier = c;
         state.mission.startTime = state.time; // tail clock starts when the courier spawns
       } else {
-        // Courier drives a loop; suspicion rises if too close or ahead of it.
-        courier.angle += Math.sin(state.time * 0.1) * 0.4 * dt;
-        courier.speed = courier.cruise;
+        // Courier drives the road grid (gentle weave via intersection turns).
+        steerOnRoads(state, courier, dt, 0.004);
         courier.x += Math.cos(courier.angle) * courier.speed * dt;
         courier.y += Math.sin(courier.angle) * courier.speed * dt;
+        courier.x = clamp(courier.x, 40, WORLD.w - 40); courier.y = clamp(courier.y, 40, WORLD.h - 40);
         const d = dist(p.x, p.y, courier.x, courier.y);
         if (d < 110) state.tailSuspicion += 30 * dt;
         else if (d > 520) state.tailSuspicion += 8 * dt; // lost him
@@ -405,13 +422,23 @@ function updateMission(state, dt) {
     case 'm3': { // breach the prison van
       let van = state.cars.find(c => c.kind === 'van');
       if (!van) {
-        van = makeCar(state, 'van', t.x, t.y, Math.PI / 2, '#c8c8c8');
+        // Spawn on the nearest road, not the raw target (which sits in a block).
+        const rp = state.city.nearestRoadPoint(t.x, t.y);
+        van = makeCar(state, 'van', rp.x, rp.y, 0, '#c8c8c8');
+        // Start along the road it spawns on (south on a vertical road,
+        // east on a horizontal one) so it drives the grid, not through blocks.
+        const onV = state.city.roadsV.some(r => Math.abs(rp.x - r) < 30);
+        van.angle = onV ? Math.PI / 2 : 0;
+        van.roadDir = van.angle;
         van.cruise = 130; state.mission.van = van;
         showMessage(state, 'Ram the van, then stay close while Juno hacks it');
       } else {
-        van.angle += 0.1 * dt; van.speed = van.cruise;
-        van.x += Math.cos(van.angle) * van.speed * dt;
-        van.y += Math.sin(van.angle) * van.speed * dt;
+        if (!van.dead) { // a burning wreck stays put while Juno hacks it
+          steerOnRoads(state, van, dt, 0.004);
+          van.x += Math.cos(van.angle) * van.speed * dt;
+          van.y += Math.sin(van.angle) * van.speed * dt;
+          van.x = clamp(van.x, 40, WORLD.w - 40); van.y = clamp(van.y, 40, WORLD.h - 40);
+        }
         const d = dist(p.x, p.y, van.x, van.y);
         const pc = playerCar(state);
         if (pc && d < 70 && pc.speed > 200) { damageCar(state, van, 30, p.x, p.y); state.audio.crash(); }
